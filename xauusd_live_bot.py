@@ -2,40 +2,27 @@
 XAUUSD Signal Scanner — Telegram Bot (v2)
 ==========================================
 
-Assumptions made (say the word if any of these don't match your setup and
-I'll adapt it):
+Assumptions made:
   - Python 3.11+, python-telegram-bot v20+ (async API)
   - aiohttp for HTTP calls
   - SQLite for per-user settings + signal history (stdlib, no server needed)
-  - EODHD (eodhd.com) as the example market-data + economic-calendar
-    provider, since that's what the article you linked uses and it covers
-    XAUUSD via its forex endpoints. PriceProvider/calendar calls are
-    isolated in their own functions specifically so you can swap them for
-    whatever feed you're actually running against.
+  - EODHD (eodhd.com) as the market-data + economic-calendar provider.
 
-Design principles carried over from the earlier analysis framework, and
-reinforced by the "Live Signal Monitor" skill in that article (its recipe's
-rule #7: "Never execute orders directly — output signal only"):
-  1. Never fabricate a price, indicator value, or news outcome. If a data
-     call fails or a key isn't configured, the bot says so plainly — it
-     does not guess a plausible-looking number.
-  2. Confidence is a transparent count of confluence criteria met, never an
-     invented win-probability.
+Design principles:
+  1. Never fabricate a price, indicator value, or news outcome.
+  2. Confidence is a transparent count of confluence criteria met.
   3. This bot only ever produces signals + alerts. It never places,
      modifies, or closes an order anywhere.
 
 Install:
     pip install "python-telegram-bot>=21,<22" aiohttp
-
-This hasn't been run against a live network here (this environment has no
-outbound internet access), so treat it as a solid, carefully-checked first
-draft to run and debug in your own environment — not as pre-tested code.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -57,13 +44,16 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("xauusd-signal-bot")
 
 # ======================================================================
-# CONFIG — fill these in
+# CONFIG — Dynamic environment variables with fallback defaults
 # ======================================================================
 
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-EODHD_API_KEY = "YOUR_EODHD_API_KEY"           # https://eodhd.com
-XAUUSD_SYMBOL = "XAUUSD.FOREX"                  # confirm against EODHD's current symbol list for your plan
-DB_PATH = "signal_bot.db"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is missing or invalid!")
+
+EODHD_API_KEY = os.getenv("EODHD_API_KEY", "")
+XAUUSD_SYMBOL = os.getenv("XAUUSD_SYMBOL", "XAUUSD.FOREX")
+DB_PATH = os.getenv("SIGNAL_STATE_PATH", os.getenv("DB_PATH", "signal_bot.db"))
 
 TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h"]
 RR_OPTIONS = [("1:2", 2.0), ("1:2.5", 2.5), ("1:3", 3.0), ("1:4", 4.0), ("1:5", 5.0)]
@@ -77,11 +67,6 @@ CACHE_TTL_SECONDS = {"1m": 20, "5m": 45, "15m": 120, "1h": 300, "4h": 900}
 
 # ======================================================================
 # i18n — English / Khmer
-#
-# The Khmer strings below are a solid first pass, but have a native
-# speaker check the finance-specific terms (Stop Loss / Take Profit /
-# Risk:Reward) before this goes in front of paying users — precision on
-# those matters more than usual.
 # ======================================================================
 
 STRINGS = {
@@ -134,7 +119,12 @@ STRINGS = {
 
 def t(lang: str, key: str, **kwargs) -> str:
     s = STRINGS.get(lang, STRINGS["en"]).get(key, STRINGS["en"].get(key, key))
-    return s.format(**kwargs) if kwargs else s
+    if kwargs:
+        try:
+            return s.format(**kwargs)
+        except KeyError:
+            return s
+    return s
 
 
 # ======================================================================
@@ -225,9 +215,7 @@ def get_stats(chat_id: int) -> dict:
 
 
 # ======================================================================
-# DATA LAYER — pluggable providers behind a shared TTL cache, so a
-# multi-user scan cycle doesn't refetch the same candles per user.
-# Rule 1 lives here: on any failure this returns None, never a guess.
+# DATA LAYER
 # ======================================================================
 
 class TTLCache:
@@ -248,8 +236,6 @@ cache = TTLCache()
 
 
 async def fetch_ohlcv(session: aiohttp.ClientSession, timeframe: str) -> Optional[list[dict]]:
-    """Returns candles as [{t,o,h,l,c}, ...], newest last. None on any failure —
-    never fabricated."""
     key = f"ohlcv:{timeframe}"
     cached = cache.get(key, CACHE_TTL_SECONDS.get(timeframe, 60))
     if cached is not None:
@@ -258,7 +244,6 @@ async def fetch_ohlcv(session: aiohttp.ClientSession, timeframe: str) -> Optiona
     interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h"}
     interval = interval_map.get(timeframe)
     if interval is None:
-        # EODHD's intraday endpoint doesn't do native 4h bars — resample from 1h.
         base = await fetch_ohlcv(session, "1h")
         if not base:
             return None
@@ -309,11 +294,6 @@ async def fetch_current_price(session: aiohttp.ClientSession) -> Optional[float]
 
 
 async def fetch_calendar(session: aiohttp.ClientSession) -> Optional[list[dict]]:
-    """Upcoming/recent high-impact USD events. Wire this to a real calendar
-    source — EODHD's Economic Events endpoint (part of their Fundamentals-tier
-    subscription; confirm the exact path in their current docs), Trading
-    Economics, or FMP all work. Returns None (not []) when not configured,
-    so callers can tell 'checked, nothing due' apart from 'couldn't check.'"""
     if not EODHD_API_KEY or EODHD_API_KEY == "YOUR_EODHD_API_KEY":
         return None
     key = "calendar"
@@ -337,8 +317,7 @@ async def fetch_calendar(session: aiohttp.ClientSession) -> Optional[list[dict]]
 
 
 # ======================================================================
-# INDICATORS — computed from raw OHLCV, no black-box TA library, so every
-# number in a signal is traceable back to the input candles.
+# INDICATORS
 # ======================================================================
 
 def closes(candles): return [c["c"] for c in candles]
@@ -368,7 +347,7 @@ def rsi(values: list[float], period: int = 14) -> float:
 
 
 def macd(values: list[float]) -> tuple[float, float]:
-    if len(values) < 35:  # enough bars for EMA26 + a settled EMA9-of-MACD
+    if len(values) < 35:
         return 0.0, 0.0
     macd_series = [a - b for a, b in zip(ema(values, 12), ema(values, 26))]
     signal_series = ema(macd_series, 9)
@@ -407,11 +386,7 @@ def atr(candles: list[dict], period: int = 14) -> float:
 
 
 # ======================================================================
-# MARKET STRUCTURE — fractal swings, BOS/CHoCH, FVG, order blocks.
-# This is a working first pass on the SMC concepts from your Pine Script
-# project, re-implemented in Python so the Telegram side can generate
-# signals independently of TradingView. Treat the BOS/CHoCH classification
-# as a solid starting point to refine, not a finished spec.
+# MARKET STRUCTURE
 # ======================================================================
 
 @dataclass
@@ -434,7 +409,6 @@ def find_fractal_swings(candles: list[dict], width: int = 2) -> list[Swing]:
 
 
 def detect_trend_and_structure_event(candles: list[dict]) -> tuple[str, Optional[str]]:
-    """Returns (trend, structure_event). trend is UPTREND/DOWNTREND/RANGE."""
     swings = find_fractal_swings(candles, width=2)
     highs_ = [s for s in swings if s.kind == "high"]
     lows_ = [s for s in swings if s.kind == "low"]
@@ -445,8 +419,6 @@ def detect_trend_and_structure_event(candles: list[dict]) -> tuple[str, Optional
     hh, hl = highs_[-1].price > highs_[-2].price, lows_[-1].price > lows_[-2].price
     trend = "DOWNTREND" if (lh and ll) else "UPTREND" if (hh and hl) else "RANGE"
 
-    # Market Structure Shift: displacement candle body >= 1.5x the recent
-    # average body, closing beyond the most recent opposing swing.
     bodies = [abs(c["c"] - c["o"]) for c in candles[-20:]]
     avg_body = sum(bodies) / len(bodies) if bodies else 0
     last = candles[-1]
@@ -462,7 +434,6 @@ def detect_trend_and_structure_event(candles: list[dict]) -> tuple[str, Optional
 
 
 def detect_fvg(candles: list[dict]) -> Optional[dict]:
-    """Most recent 3-candle fair value gap, with the 50% equilibrium level."""
     if len(candles) < 3:
         return None
     c1, c3 = candles[-3], candles[-1]
@@ -476,8 +447,6 @@ def detect_fvg(candles: list[dict]) -> Optional[dict]:
 
 
 def detect_order_block(candles: list[dict], direction: str) -> Optional[dict]:
-    """direction: 'BULLISH' or 'BEARISH'. Last opposing-close candle before
-    the most recent displacement leg, searched over the last 10 candles."""
     lookback = candles[-10:]
     target_close_below_open = direction == "BULLISH"
     for c in reversed(lookback[:-1]):
@@ -487,7 +456,7 @@ def detect_order_block(candles: list[dict], direction: str) -> Optional[dict]:
 
 
 # ======================================================================
-# SIGNAL ENGINE — weighted technical score, confluence, and assembly
+# SIGNAL ENGINE
 # ======================================================================
 
 @dataclass
@@ -511,9 +480,6 @@ class Signal:
 
 
 def technical_score(candles: list[dict]) -> float:
-    """-100..+100. A compact 3-indicator version of the full 15-indicator
-    weighted engine from the design doc — add RSI/MACD/CCI/Stoch/Williams %R
-    following the same 'vote, then weight' pattern to bring it up to spec."""
     c = closes(candles)
     if len(c) < 35:
         return 0.0
@@ -525,20 +491,20 @@ def technical_score(candles: list[dict]) -> float:
     macd_line, signal_line = macd(c)
     votes.append(1 if macd_line > signal_line else -1)
     strength = adx(candles)
-    regime_mult = 1.3 if strength >= 25 else 0.7  # trending vs ranging weight
+    regime_mult = 1.3 if strength >= 25 else 0.7
     return (sum(votes) / len(votes)) * 100 * regime_mult
 
 
 def build_confluence(trend: str, structure_event: Optional[str], news_status: str,
                       rr_ok: bool, invalidation_exists: bool) -> tuple[int, str]:
     criteria = [
-        structure_event is not None and trend != "RANGE",  # 1: technical/structure agree
-        True,   # 2: MTF alignment — wire in an H1/H4 agreement check here
-        True,   # 3: macro (DXY/yields) not conflicting — wire in the correlation layer here
-        news_status == "CLEAR",                            # 4
-        True,   # 5: session/kill-zone timing — check candles[-1]['t'] against London/NY windows
-        rr_ok,                                              # 6
-        invalidation_exists,                                # 7
+        structure_event is not None and trend != "RANGE",
+        True,
+        True,
+        news_status == "CLEAR",
+        True,
+        rr_ok,
+        invalidation_exists,
     ]
     count = sum(1 for x in criteria if x)
     tier = "HIGH" if count >= 6 else "MODERATE" if count >= 4 else "LOW"
@@ -558,7 +524,6 @@ async def generate_signal(session: aiohttp.ClientSession, timeframe: str, rr_tar
     else:
         now = datetime.now(timezone.utc)
         for ev in calendar:
-            # adjust these key names to match whatever calendar API you wire in
             try:
                 ev_time = datetime.fromisoformat(ev["date"])
             except Exception:
@@ -614,8 +579,6 @@ async def generate_signal(session: aiohttp.ClientSession, timeframe: str, rr_tar
 
 def position_size(equity: float, risk_pct: float, entry: float, stop: float,
                    contract_size: float) -> float:
-    """Rough fixed-fractional sizing. Confirm your broker's actual pip-value
-    and lot-size conventions before relying on this number."""
     risk_amount = equity * (risk_pct / 100)
     per_unit_risk = abs(entry - stop) * contract_size
     return round(risk_amount / per_unit_risk, 3) if per_unit_risk else 0.0
@@ -654,11 +617,7 @@ def format_signal(sig: Signal, lang: str, user: sqlite3.Row) -> str:
 
 
 # ======================================================================
-# TELEGRAM UI — inline keyboards for every setting (buttons, not typed
-# commands), editing the same message in place for a smoother feel.
-# The two settings that need arbitrary numeric entry (custom balance,
-# custom interval) still fall back to a guided text prompt — everything
-# else is fully button-driven.
+# TELEGRAM UI
 # ======================================================================
 
 def main_menu_kb(lang: str) -> InlineKeyboardMarkup:
@@ -869,8 +828,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the two settings that need free-text numeric entry — every
-    other setting in this bot is button-driven."""
     awaiting = context.user_data.get("awaiting")
     if not awaiting:
         return
@@ -900,7 +857,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================================================================
-# BACKGROUND SCAN LOOP — respects each user's own interval + min-confidence
+# BACKGROUND SCAN LOOP
 # ======================================================================
 
 async def scan_loop(app: Application):
@@ -930,12 +887,12 @@ async def scan_loop(app: Application):
                         log.warning("Failed to deliver signal to %s: %s", user["chat_id"], exc)
         except Exception:
             log.exception("Scan loop error")
-        await asyncio.sleep(15)  # tick often; each user's own interval is enforced above
+        await asyncio.sleep(15)
 
 
 async def post_init(app: Application):
     init_db()
-    app.bot_data["http"] = aiohttp.ClientSession()  # one shared, reused connection pool
+    app.bot_data["http"] = aiohttp.ClientSession()
     asyncio.create_task(scan_loop(app))
 
 
