@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -994,6 +995,17 @@ async def post_shutdown(app: Application):
         await session.close()
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """A Conflict right at startup is expected during a Railway redeploy —
+    the outgoing container's last poll can overlap the incoming one's first
+    for a few seconds and self-resolve. Log that quietly; log anything else
+    properly instead of dumping a full traceback."""
+    if isinstance(context.error, Conflict):
+        log.warning("Conflict from a competing getUpdates call — should self-resolve within a few seconds.")
+        return
+    log.error("Unhandled exception while processing an update.", exc_info=context.error)
+
+
 def main():
     app = (
         Application.builder()
@@ -1005,6 +1017,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     app.run_polling()
 
 
